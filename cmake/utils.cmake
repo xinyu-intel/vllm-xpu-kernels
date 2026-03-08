@@ -585,6 +585,7 @@ function(add_xe2_kernel_library LIBRARY_NAME)
   # Link torch libraries
   target_link_libraries(${LIBRARY_NAME} PRIVATE torch)
   target_link_libraries(${LIBRARY_NAME} PRIVATE ${TORCH_LIBRARIES})
+  target_link_libraries(${LIBRARY_NAME} PRIVATE nlohmann_json::nlohmann_json)
 
   message(
     STATUS

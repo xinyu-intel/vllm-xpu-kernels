@@ -136,6 +136,19 @@ include(FetchContent)
 file(MAKE_DIRECTORY ${FETCHCONTENT_BASE_DIR}) # Ensure the directory exists
 message(STATUS "FetchContent base directory: ${FETCHCONTENT_BASE_DIR}")
 
+# JSON parser used by policy-driven kernel dispatch.
+find_package(nlohmann_json QUIET)
+if(NOT nlohmann_json_FOUND)
+  message(STATUS "nlohmann_json not found, fetching from GitHub...")
+  FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_PROGRESS TRUE
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(nlohmann_json)
+endif()
+
 # Set RPATH to $ORIGIN so that the extensions can find their shared libraries
 # when loaded by Python.
 set(CMAKE_INSTALL_RPATH "$ORIGIN")

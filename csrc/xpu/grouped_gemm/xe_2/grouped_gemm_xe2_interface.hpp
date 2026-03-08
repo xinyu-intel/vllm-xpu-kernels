@@ -57,6 +57,7 @@
 
 #include "gemm_xe2_policy.hpp"
 #include "grouped_gemm_xe2.hpp"
+#include "moe_policy_dispatch.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -175,8 +176,8 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     bool is_B_mxfp4) {
   auto& dpcpp_queue =
       at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
-  auto A_dtype = ptr_A.dtype();
-  auto B_dtype = ptr_B.dtype();
+  auto A_dtype = ptr_A.scalar_type();
+  auto B_dtype = ptr_B.scalar_type();
   bool is_weight_fp8 =
       ((B_dtype == at::kFloat8_e4m3fn) || (B_dtype == at::kFloat8_e5m2));
 
@@ -245,6 +246,64 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
       group_size,                                                              \
       static_cast<int*>(atomic_buffer.data_ptr()));
 
+#define DispatchPolicyById(LauncherCallER, DefaultPolicy) \
+  switch (policy_id) {                                    \
+    case MoePolicyId::kWG_8_64_32_SG_1_4_1: {             \
+      using policy = wg_8_64_32_sg_1_4_1;                 \
+      LauncherCallER(policy);                             \
+      break;                                              \
+    }                                                     \
+    case MoePolicyId::kWG_16_64_32_SG_1_4_1: {            \
+      using policy = wg_16_64_32_sg_1_4_1;                \
+      LauncherCallER(policy);                             \
+      break;                                              \
+    }                                                     \
+    case MoePolicyId::kWG_32_64_32_SG_1_4_1: {            \
+      using policy = wg_32_64_32_sg_1_4_1;                \
+      LauncherCallER(policy);                             \
+      break;                                              \
+    }                                                     \
+    case MoePolicyId::kWG_128_256_32_SG_4_8_1: {          \
+      using policy = wg_128_256_32_sg_4_8_1;              \
+      LauncherCallER(policy);                             \
+      break;                                              \
+    }                                                     \
+    case MoePolicyId::kWG_256_128_32_SG_8_2_1: {          \
+      using policy = wg_256_128_32_sg_8_2_1;              \
+      LauncherCallER(policy);                             \
+      break;                                              \
+    }                                                     \
+    case MoePolicyId::kWG_128_64_32_SG_4_2_1: {           \
+      using policy = wg_128_64_32_sg_4_2_1;               \
+      LauncherCallER(policy);                             \
+      break;                                              \
+    }                                                     \
+    case MoePolicyId::kWG_128_128_32_SG_4_2_1: {          \
+      using policy = wg_128_128_32_sg_4_2_1;              \
+      LauncherCallER(policy);                             \
+      break;                                              \
+    }                                                     \
+    case MoePolicyId::kWG_256_64_32_SG_8_2_1: {           \
+      using policy = wg_256_64_32_sg_8_2_1;               \
+      LauncherCallER(policy);                             \
+      break;                                              \
+    }                                                     \
+    case MoePolicyId::kWG_256_256_32_SG_8_4_1: {          \
+      using policy = wg_256_256_32_sg_8_4_1;              \
+      LauncherCallER(policy);                             \
+      break;                                              \
+    }                                                     \
+    default: {                                            \
+      using policy = DefaultPolicy;                       \
+      LauncherCallER(policy);                             \
+      break;                                              \
+    }                                                     \
+  }
+
+  const std::string dtype_key = get_dtype_policy_key(A_dtype, B_dtype);
+  const MoePolicyId policy_id =
+      MoePolicyManager::get().select_policy(dtype_key, N, K, A_avg_M);
+
   if (is_B_int4 || is_B_mxfp4) {
     TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
     TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
@@ -286,16 +345,7 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     }                                                                       \
   }
 
-    if (A_avg_M <= 32) {
-      using policy = w4a16_policy_m_16;
-      W4A16LauncherCallER(policy);
-    } else if (A_avg_M <= 128) {
-      using policy = w4a16_policy_m_32;
-      W4A16LauncherCallER(policy);
-    } else {
-      using policy = w4a16_policy;
-      W4A16LauncherCallER(policy);
-    }
+    DispatchPolicyById(W4A16LauncherCallER, wg_128_256_32_sg_4_8_1);
 #undef W4A16LauncherCallER
   } else if (is_weight_fp8) {
     TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
@@ -322,16 +372,7 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e5m2_t, float); \
   }
 
-    if (A_avg_M <= 32) {
-      using policy = w8a16_policy_m_16;
-      W8A16LauncherCallER(policy);
-    } else if (A_avg_M <= 128) {
-      using policy = w8a16_policy_m_32;
-      W8A16LauncherCallER(policy);
-    } else {
-      using policy = w8a16_policy;
-      W8A16LauncherCallER(policy);
-    }
+    DispatchPolicyById(W8A16LauncherCallER, wg_128_256_32_sg_4_8_1);
 #undef W8A16LauncherCallER
   } else {
     TORCH_CHECK(
@@ -346,21 +387,10 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, scalar_t, scalar_t); \
   }
 
-    if (A_avg_M <= 8) {
-      using policy = w16a16_policy_m_8;
-      W16A16LauncherCallER(policy);
-    } else if (A_avg_M <= 16) {
-      using policy = w16a16_policy_m_16;
-      W16A16LauncherCallER(policy);
-    } else if (A_avg_M <= 32) {
-      using policy = w16a16_policy_m_32;
-      W16A16LauncherCallER(policy);
-    } else {
-      using policy = w16a16_policy;
-      W16A16LauncherCallER(policy);
-    }
+    DispatchPolicyById(W16A16LauncherCallER, wg_256_128_32_sg_8_2_1);
 #undef W16A16LauncherCallER
   }
+#undef DispatchPolicyById
 #undef MoEGEMMLauncherCallER
   return ptr_D;
 }
