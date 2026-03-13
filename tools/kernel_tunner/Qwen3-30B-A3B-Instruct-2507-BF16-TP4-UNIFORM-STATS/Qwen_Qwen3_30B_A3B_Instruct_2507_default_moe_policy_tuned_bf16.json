@@ -1,0 +1,104 @@
+{
+  "version": 3,
+  "dispatch_key": "avg_m",
+  "context": {
+    "model": "example_model",
+    "kernel_family": "grouped_gemm",
+    "trace_source": "decode_topk_ids_dump",
+    "tuning_selected_batch_size": 80,
+    "tuning_selected_kernel_time_us": 727.7660000000001
+  },
+  "global": {
+    "bf16": {
+      "default_policy": "wg_256_128_32_sg_8_2_1",
+      "rules": [
+        {
+          "avg_m_max": 8,
+          "policy": "wg_8_64_32_sg_1_4_1"
+        },
+        {
+          "avg_m_max": 16,
+          "policy": "wg_16_64_32_sg_1_4_1"
+        },
+        {
+          "avg_m_max": 32,
+          "policy": "wg_32_64_32_sg_1_4_1"
+        }
+      ]
+    },
+    "fp8_w8a16": {
+      "default_policy": "wg_128_256_32_sg_4_8_1",
+      "rules": [
+        {
+          "avg_m_max": 8,
+          "policy": "wg_8_64_32_sg_1_4_1"
+        },
+        {
+          "avg_m_max": 16,
+          "policy": "wg_16_64_32_sg_1_4_1"
+        },
+        {
+          "avg_m_max": 32,
+          "policy": "wg_32_64_32_sg_1_4_1"
+        }
+      ]
+    },
+    "mxfp4_w4a16": {
+      "default_policy": "wg_128_256_32_sg_4_8_1",
+      "rules": [
+        {
+          "avg_m_max": 8,
+          "policy": "wg_8_64_32_sg_1_4_1"
+        },
+        {
+          "avg_m_max": 16,
+          "policy": "wg_16_64_32_sg_1_4_1"
+        },
+        {
+          "avg_m_max": 32,
+          "policy": "wg_32_64_32_sg_1_4_1"
+        }
+      ]
+    }
+  },
+  "overrides": [
+    {
+      "dtype": "bf16",
+      "n": 384,
+      "k": 2048,
+      "tag": "w13",
+      "policies": {
+        "default_policy": "wg_256_128_32_sg_8_2_1",
+        "rules": [
+          {
+            "avg_m_max": 5,
+            "policy": "wg_8_64_32_sg_1_4_1"
+          },
+          {
+            "avg_m_max": 512,
+            "policy": "wg_128_128_32_sg_4_2_1"
+          }
+        ]
+      }
+    },
+    {
+      "dtype": "bf16",
+      "n": 2048,
+      "k": 192,
+      "tag": "w2",
+      "policies": {
+        "default_policy": "policy1",
+        "rules": [
+          {
+            "avg_m_max": 5,
+            "policy": "wg_128_128_32_sg_4_2_1"
+          },
+          {
+            "avg_m_max": 512,
+            "policy": "wg_32_64_32_sg_1_4_1"
+          }
+        ]
+      }
+    }
+  ]
+}
