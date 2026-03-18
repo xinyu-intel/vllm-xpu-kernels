@@ -610,7 +610,9 @@ def benchmark_config(
     start_event = torch.Event(enable_timing=True)
     end_event = torch.Event(enable_timing=True)
 
-    start_event.record()
+    start_event = [torch.Event(enable_timing=True) for i in range(num_iters)]
+    end_event = [torch.Event(enable_timing=True) for i in range(num_iters)]
+
     for i in range(num_iters):
         if use_external_token_stats:
             stride = max(1, token_stats_stride)
@@ -628,10 +630,12 @@ def benchmark_config(
             if use_external_token_stats
             else num_rows_per_expert
         )
+        start_event[i].record()
         run(num_rows_per_expert)
-    end_event.record()
-    end_event.synchronize()
-    avg = start_event.elapsed_time(end_event) / (num_iters) * 1000  # us
+        end_event[i].record()
+    torch.xpu.synchronize()
+    times = [s.elapsed_time(e) for s, e in zip(start_event, end_event)]
+    avg = sum(times) / len(times) * 1000 # us
     return avg
 
 
@@ -1129,7 +1133,7 @@ def main(args: argparse.Namespace):
                     search_space,
                     token_stats_list_bs,
                     token_stats_stride,
-                    tune_iters * 10,
+                    tune_iters,
                     block_quant_shape,
                     args.policy_config,
                     dtype_key,
@@ -1200,7 +1204,7 @@ def main(args: argparse.Namespace):
                     args.policy_config,
                     token_stats_list_bs,
                     token_stats_stride,
-                    bench_iters * 10,
+                    bench_iters,
                     block_quant_shape,
                 )
             )
