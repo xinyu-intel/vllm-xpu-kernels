@@ -636,6 +636,7 @@ def benchmark_config(
     start_event = [torch.Event(enable_timing=True) for i in range(num_iters)]
     end_event = [torch.Event(enable_timing=True) for i in range(num_iters)]
 
+    os.environ["PTI_ENABLE_COLLECTION"] = "1"
     for i in range(num_iters):
         if use_external_token_stats:
             stride = max(1, token_stats_stride)
@@ -657,6 +658,7 @@ def benchmark_config(
         run(expert_first_token_offset)
         end_event[i].record()
     torch.xpu.synchronize()
+    os.environ["PTI_ENABLE_COLLECTION"] = "0"
     times = [1000 * s.elapsed_time(e) for s, e in zip(start_event, end_event)]
     avg = sum(times) / len(times)
     return avg
