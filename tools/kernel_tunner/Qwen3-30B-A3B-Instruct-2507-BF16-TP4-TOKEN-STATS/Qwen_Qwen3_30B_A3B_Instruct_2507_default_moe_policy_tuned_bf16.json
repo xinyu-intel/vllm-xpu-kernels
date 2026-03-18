@@ -87,7 +87,7 @@
       "k": 192,
       "tag": "w2",
       "policies": {
-        "default_policy": "policy1",
+        "default_policy": "wg_256_128_32_sg_8_2_1",
         "rules": [
           {
             "avg_m_max": 5,

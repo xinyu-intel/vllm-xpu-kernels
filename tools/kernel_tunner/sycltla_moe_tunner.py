@@ -31,7 +31,8 @@ except ImportError as e:
     FUSEDMOE_UNAVAILABLE_REASON = str(e)
     FUSEDMOE_AVAILABLE = False
 
-from vllm_xpu_kernels.fused_moe_interface import cutlass_grouped_gemm_xe2
+import vllm_xpu_kernels._C
+import vllm_xpu_kernels._xpu_C
 
 POLICY_IDS = [
     "wg_256_128_32_sg_8_2_1",
@@ -374,7 +375,18 @@ def load_token_stats(
         f"token_stats_bs{batch_size}_layer{layer_id}_idx{req_idx}.pt",
     )
     if os.path.exists(bs_path):
-        return torch.load(bs_path, map_location="xpu")
+        num_rows_per_expert = torch.load(bs_path, map_location="xpu")
+        expert_first_token_offset = torch.cat(
+            [
+                torch.tensor(
+                    [0],
+                    dtype=num_rows_per_expert.dtype,
+                    device=num_rows_per_expert.device,
+                ),
+                torch.cumsum(num_rows_per_expert, dim=0),
+            ]
+        ).to(torch.int64)
+        return expert_first_token_offset
     else:
         raise FileNotFoundError(f"TopK IDs file not found: {bs_path}")
 
@@ -554,7 +566,11 @@ def benchmark_config(
         w2_scale = torch.randint(
             0,
             0x7F,
-            (num_experts, hidden_size, shard_intermediate_size // 2 // group_size),
+            (
+                num_experts,
+                hidden_size,
+                shard_intermediate_size // 2 // group_size,
+            ),
             dtype=torch.uint8,
         )
     else:
@@ -571,30 +587,40 @@ def benchmark_config(
         num_experts, device="xpu", dtype=torch.int32
     )
     init_rows_for_experts(num_tokens, topk, num_rows_per_expert)
+    expert_first_token_offset = torch.cat(
+        [
+            torch.tensor(
+                [0],
+                dtype=num_rows_per_expert.dtype,
+                device=num_rows_per_expert.device,
+            ),
+            torch.cumsum(num_rows_per_expert, dim=0),
+        ]
+    ).to(torch.int64)
 
     @torch.compile
-    def run(num_rows_per_expert):
+    def run(expert_first_token_offset):
         with config:
-            cutlass_grouped_gemm_xe2(
+            torch.ops._xpu_C.cutlass_grouped_gemm_interface(
                 x1,
                 w1,
                 w1_scale,
                 None,
                 gemm1_output,
-                num_rows_per_expert,
+                expert_first_token_offset,
                 shard_intermediate_size,
                 hidden_size,
                 num_experts,
                 False,
                 dtype_key == "mxfp4_w4a16",
             )
-            cutlass_grouped_gemm_xe2(
+            torch.ops._xpu_C.cutlass_grouped_gemm_interface(
                 x2,
                 w2,
                 w2_scale,
                 None,
                 gemm2_output,
-                num_rows_per_expert,
+                expert_first_token_offset,
                 hidden_size,
                 shard_intermediate_size // 2,
                 num_experts,
@@ -604,11 +630,8 @@ def benchmark_config(
 
     # JIT compilation & warmup
     for _ in range(10):
-        run(num_rows_per_expert)
+        run(expert_first_token_offset)
     torch.accelerator.synchronize()
-
-    start_event = torch.Event(enable_timing=True)
-    end_event = torch.Event(enable_timing=True)
 
     start_event = [torch.Event(enable_timing=True) for i in range(num_iters)]
     end_event = [torch.Event(enable_timing=True) for i in range(num_iters)]
@@ -625,17 +648,17 @@ def benchmark_config(
                 idx = (i % req_count) * stride + (i // req_count) % stride
             else:
                 idx = i % total
-        num_rows_per_expert = (
+        expert_first_token_offset = (
             token_stats_list[idx]
             if use_external_token_stats
-            else num_rows_per_expert
+            else expert_first_token_offset
         )
         start_event[i].record()
-        run(num_rows_per_expert)
+        run(expert_first_token_offset)
         end_event[i].record()
     torch.xpu.synchronize()
-    times = [s.elapsed_time(e) for s, e in zip(start_event, end_event)]
-    avg = sum(times) / len(times) * 1000 # us
+    times = [1000 * s.elapsed_time(e) for s, e in zip(start_event, end_event)]
+    avg = sum(times) / len(times)
     return avg
 
 
