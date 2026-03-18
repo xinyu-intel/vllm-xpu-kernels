@@ -612,10 +612,19 @@ def benchmark_config(
 
     start_event.record()
     for i in range(num_iters):
+        if use_external_token_stats:
+            stride = max(1, token_stats_stride)
+            total = len(token_stats_list)
+            # For token_stats laid out as [req0:layer0..L-1, req1:layer0..L-1, ...],
+            # interleave by request first for each layer offset:
+            # 0, L, 2L, ..., then 1, L+1, 2L+1, ...
+            if stride > 1 and total % stride == 0:
+                req_count = total // stride
+                idx = (i % req_count) * stride + (i // req_count) % stride
+            else:
+                idx = i % total
         num_rows_per_expert = (
-            token_stats_list[
-                (i * max(1, token_stats_stride)) % len(token_stats_list)
-            ]
+            token_stats_list[idx]
             if use_external_token_stats
             else num_rows_per_expert
         )
@@ -658,7 +667,6 @@ class BenchmarkWorker:
         block_quant_shape: list[int] = None,
     ) -> tuple[dict[str, int], float]:
 
-        set_random_seed(self.seed)
         with open(policy_template_path) as f:
             payload = json.load(f)
         trial = copy.deepcopy(payload)
@@ -1121,7 +1129,7 @@ def main(args: argparse.Namespace):
                     search_space,
                     token_stats_list_bs,
                     token_stats_stride,
-                    tune_iters,
+                    tune_iters * 10,
                     block_quant_shape,
                     args.policy_config,
                     dtype_key,
@@ -1192,7 +1200,7 @@ def main(args: argparse.Namespace):
                     args.policy_config,
                     token_stats_list_bs,
                     token_stats_stride,
-                    bench_iters,
+                    bench_iters * 10,
                     block_quant_shape,
                 )
             )
