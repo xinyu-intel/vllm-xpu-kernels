@@ -89,7 +89,8 @@ void MoEGEMMLauncher(
     const int64_t* expert_first_token_offset,
     const int num_experts,
     const int group_size,
-    int32_t* atomic_buffer) {
+    int32_t* atomic_buffer,
+    const int32_t* expert_num_tokens = nullptr) {
   using ElementA_non_CV = cutlass::platform::remove_cv_t<ElementA>;
   auto op = XE_DPAS_TT<8, float, ElementA_non_CV>{};
 
@@ -155,7 +156,8 @@ void MoEGEMMLauncher(
               gemm_n,
               gemm_k,
               atomic_buffer,
-              local_mem);
+              local_mem,
+              expert_num_tokens);
         });
   });
   EventManager::getInstance().addEvent(event);
@@ -172,7 +174,8 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     int64_t K,
     int64_t num_experts,
     bool is_B_int4,
-    bool is_B_mxfp4) {
+    bool is_B_mxfp4,
+    const c10::optional<at::Tensor>& expert_num_tokens) {
   auto& dpcpp_queue =
       at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
   auto A_dtype = ptr_A.dtype();
@@ -243,7 +246,10 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
       reinterpret_cast<int64_t*>(expert_first_token_offset.data_ptr()),        \
       num_experts,                                                             \
       group_size,                                                              \
-      static_cast<int*>(atomic_buffer.data_ptr()));
+      static_cast<int*>(atomic_buffer.data_ptr()),                             \
+      expert_num_tokens.has_value()                                            \
+          ? static_cast<const int32_t*>(expert_num_tokens->data_ptr())         \
+          : static_cast<const int32_t*>(nullptr));
 
   if (is_B_int4 || is_B_mxfp4) {
     TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");

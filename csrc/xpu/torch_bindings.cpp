@@ -45,7 +45,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "Tensor "
       "ptr_D, Tensor "
       "expert_first_token_offset, int N, int K, int "
-      "num_experts, bool is_B_int4, bool is_B_mxfp4) -> "
+      "num_experts, bool is_B_int4, bool is_B_mxfp4, "
+      "Tensor? expert_num_tokens) -> "
       "Tensor");
   xpu_ops.impl(
       "cutlass_grouped_gemm_interface",

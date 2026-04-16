@@ -39,12 +39,13 @@ def cutlass_grouped_gemm(input_A, input_B, bias, output, expert_token_count, n,
         K=k,
         num_experts=num_experts,
         is_B_int4=False,
-        is_B_mxfp4=False)
+        is_B_mxfp4=False,
+        expert_num_tokens=None)
 
 
 def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
                              num_rows_per_expert, n, k, num_experts, is_B_int4,
-                             is_B_mxfp4):
+                             is_B_mxfp4, expert_num_tokens=None):
     expert_first_token_offset = torch.cat([
         torch.tensor([0],
                      dtype=num_rows_per_expert.dtype,
@@ -62,7 +63,8 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
         K=k,
         num_experts=num_experts,
         is_B_int4=is_B_int4,
-        is_B_mxfp4=is_B_mxfp4)
+        is_B_mxfp4=is_B_mxfp4,
+        expert_num_tokens=expert_num_tokens)
 
 
 def ceilDiv(a, b):
@@ -244,7 +246,8 @@ def xpu_fused_moe(hidden_states,
         K=hidden_size,
         num_experts=num_experts,
         is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+        is_B_mxfp4=is_mxfp4,
+        expert_num_tokens=None)
 
     inter_size_scale = 2 if activation == "relu2_no_mul" else 1
     # act
@@ -282,7 +285,8 @@ def xpu_fused_moe(hidden_states,
         K=inter_size * inter_size_scale,
         num_experts=num_experts,
         is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+        is_B_mxfp4=is_mxfp4,
+        expert_num_tokens=None)
 
     torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
                                 unpermuted_row_to_permuted_row,

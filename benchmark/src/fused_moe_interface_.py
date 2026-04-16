@@ -39,7 +39,8 @@ def cutlass_grouped_gemm(input_A, input_B, bias, output, expert_token_count, n,
         K=k,
         num_experts=num_experts,
         is_B_int4=False,
-        is_B_mxfp4=False)
+        is_B_mxfp4=False,
+        expert_num_tokens=None)
 
 
 def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
@@ -62,7 +63,8 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
         K=k,
         num_experts=num_experts,
         is_B_int4=is_B_int4,
-        is_B_mxfp4=is_B_mxfp4)
+        is_B_mxfp4=is_B_mxfp4,
+        expert_num_tokens=None)
 
 
 def ceilDiv(a, b):
@@ -259,7 +261,8 @@ def xpu_fused_moe_CalKernelTime(hidden_states,
         K=hidden_size,
         num_experts=num_experts,
         is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+        is_B_mxfp4=is_mxfp4,
+        expert_num_tokens=None)
     end_event.record()
     end_event.synchronize()
     gemm1_kernel_time = start_event.elapsed_time(end_event)
@@ -300,7 +303,8 @@ def xpu_fused_moe_CalKernelTime(hidden_states,
         K=inter_size,
         num_experts=num_experts,
         is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+        is_B_mxfp4=is_mxfp4,
+        expert_num_tokens=None)
     end_event.record()
     end_event.synchronize()
     gemm2_kernel_time = start_event.elapsed_time(end_event)

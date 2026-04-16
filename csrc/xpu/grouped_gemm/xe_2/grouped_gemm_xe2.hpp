@@ -84,7 +84,8 @@ CUTE_DEVICE void MoEGEMM(
     const int32_t gemm_n,
     const int32_t gemm_k,
     int32_t* atomic_buffer,
-    const sycl::local_accessor<int32_t, 1>& slm_mem_const) {
+    const sycl::local_accessor<int32_t, 1>& slm_mem_const,
+    const int32_t* expert_num_tokens = nullptr) {
   constexpr char actual_layout_of_B = LayoutKindB ^ ('R' ^ 'C');
   static constexpr bool is_B_int4 = (std::is_same_v<ElementB, uint8_t>) &&
                                     (!std::is_same_v<ElementS, uint8_t>);
@@ -121,7 +122,8 @@ CUTE_DEVICE void MoEGEMM(
 
   for (int i = 0; i < num_experts; ++i) {
     int cumsum_rows_for_experts = expert_first_token_offset[i + 1];
-    int gemm_m = cumsum_rows_for_experts - pre_rows;
+    int gemm_m = expert_num_tokens ? expert_num_tokens[i]
+                                   : (cumsum_rows_for_experts - pre_rows);
     int cumsum_tiles_for_experts =
         (gemm_m + wg_tile_m - 1) / wg_tile_m + pre_tiles;
 
