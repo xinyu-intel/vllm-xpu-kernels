@@ -40,6 +40,20 @@ ALL_BENCHMARKS = [
 
 DEVICE = "xpu"
 
+# Target total pool size in bytes to exceed GPU last-level cache.
+# 512MB should flush L2 on most Intel GPUs (BMG ~18MB, PVC ~408MB).
+COLD_CACHE_TARGET_BYTES = 512 * 1024 * 1024
+
+
+def compute_pool_size(per_pair_bytes, max_pool=200, cold_cache=True):
+    """Compute number of tensor pairs needed to bust the GPU cache."""
+    if not cold_cache:
+        return 1
+    if per_pair_bytes == 0:
+        return max_pool
+    pool = max(2, COLD_CACHE_TARGET_BYTES // per_pair_bytes)
+    return min(pool, max_pool)
+
 
 def clear_xpu_cache():
     torch.xpu.synchronize()
@@ -68,20 +82,19 @@ def calculate_memory_bytes(m, n, k, x_dtype, w_dtype=None):
 
 # Generic NK shapes for benchmarking (M is swept like model_shapes)
 GENERIC_NK = [
-    (1024, 2048),
-    (2048, 2048),
-    (4096, 4096),
-    (12288, 4096),
-    (1024, 8192),
+    (5120, 1024),
+    (5120, 2048),
+    (5120, 4096),
+    (5120, 8192),
+    (5120, 16384),
 ]
 
 M_SIZES = [
-    1, 2, 4, 8, 16, 32, 64, 128,
-    256, 384, 512, 640, 768, 896, 1024, 4096,
+    4096,
 ]
 
 FP8_DTYPES = [torch.float8_e4m3fn, torch.float8_e5m2]
-OUT_DTYPES = [torch.float16, torch.bfloat16]
+OUT_DTYPES = [torch.bfloat16]
 
 # KPI model weight shapes: {model/TP: [(K, N), ...]}
 # All shapes are pre-resolved with TP/EP division applied.
@@ -511,7 +524,7 @@ def check_mxfp4_gemm(config):
 # ---------------------------------------------------------------------------
 
 
-def get_bf16_gemm_benchmark(configs, iterations):
+def get_bf16_gemm_benchmark(configs, iterations, cold_cache=True):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -530,16 +543,24 @@ def get_bf16_gemm_benchmark(configs, iterations):
 
         assert iterations > 5
 
-        input = torch.randn([m, k], dtype=dtype, device=DEVICE) / 10.0
-        weight = torch.randn([n, k], dtype=dtype, device=DEVICE) / 10.0
+        elem_size = torch.tensor([], dtype=dtype).element_size()
+        per_pair_bytes = (m * k + n * k) * elem_size
+        pool_size = compute_pool_size(per_pair_bytes, iterations, cold_cache)
+
+        inputs = [torch.randn([m, k], dtype=dtype, device=DEVICE) / 10.0
+                  for _ in range(pool_size)]
+        weights = [torch.randn([n, k], dtype=dtype, device=DEVICE) / 10.0
+                   for _ in range(pool_size)]
 
         start_event = torch.xpu.Event(enable_timing=True)
         end_event = torch.xpu.Event(enable_timing=True)
         for index in range(5):
-            torch.nn.functional.linear(input, weight)
+            torch.nn.functional.linear(inputs[index % pool_size],
+                                       weights[index % pool_size])
         start_event.record()
         for index in range(iterations - 5):
-            torch.nn.functional.linear(input, weight)
+            torch.nn.functional.linear(inputs[index % pool_size],
+                                       weights[index % pool_size])
         end_event.record()
         torch.xpu.synchronize()
         ms = start_event.elapsed_time(end_event) / (iterations - 5)
@@ -562,7 +583,7 @@ def get_bf16_gemm_benchmark(configs, iterations):
 # ---------------------------------------------------------------------------
 
 
-def get_fp8_gemm_benchmark(configs, iterations):
+def get_fp8_gemm_benchmark(configs, iterations, cold_cache=True):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -583,22 +604,29 @@ def get_fp8_gemm_benchmark(configs, iterations):
 
         assert iterations > 5
 
-        input = torch.randn([m, k], dtype=out_dtype, device=DEVICE) / 10.0
-        weight = torch.randn([n, k], dtype=out_dtype, device=DEVICE) / 10.0
+        fp8_elem = torch.tensor([], dtype=fp8_dtype).element_size()
+        per_pair_bytes = (m * k + n * k) * fp8_elem
+        pool_size = compute_pool_size(per_pair_bytes, iterations, cold_cache)
 
         scale_src = torch.tensor(4.0, device=DEVICE)
         scale_wei = torch.tensor(4.0, device=DEVICE)
 
-        input_fp8, _ = scaled_fp8_quant(input, scale_src, fp8_dtype=fp8_dtype)
-        weight_fp8, _ = scaled_fp8_quant(weight, scale_wei, fp8_dtype=fp8_dtype)
-        weight_fp8_t = weight_fp8.transpose(0, 1)
+        inputs_fp8 = []
+        weights_fp8_t = []
+        for _ in range(pool_size):
+            inp = torch.randn([m, k], dtype=out_dtype, device=DEVICE) / 10.0
+            wei = torch.randn([n, k], dtype=out_dtype, device=DEVICE) / 10.0
+            inp_fp8, _ = scaled_fp8_quant(inp, scale_src, fp8_dtype=fp8_dtype)
+            wei_fp8, _ = scaled_fp8_quant(wei, scale_wei, fp8_dtype=fp8_dtype)
+            inputs_fp8.append(inp_fp8)
+            weights_fp8_t.append(wei_fp8.transpose(0, 1))
 
         start_event = torch.xpu.Event(enable_timing=True)
         end_event = torch.xpu.Event(enable_timing=True)
         for index in range(5):
             fp8_gemm(
-                input_fp8,
-                weight_fp8_t,
+                inputs_fp8[index % pool_size],
+                weights_fp8_t[index % pool_size],
                 out_dtype,
                 scale_src,
                 scale_wei,
@@ -606,8 +634,8 @@ def get_fp8_gemm_benchmark(configs, iterations):
         start_event.record()
         for index in range(iterations - 5):
             fp8_gemm(
-                input_fp8,
-                weight_fp8_t,
+                inputs_fp8[index % pool_size],
+                weights_fp8_t[index % pool_size],
                 out_dtype,
                 scale_src,
                 scale_wei,
@@ -634,7 +662,7 @@ def get_fp8_gemm_benchmark(configs, iterations):
 # ---------------------------------------------------------------------------
 
 
-def get_fp8_gemm_w8a16_benchmark(configs, iterations):
+def get_fp8_gemm_w8a16_benchmark(configs, iterations, cold_cache=True):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -655,22 +683,35 @@ def get_fp8_gemm_w8a16_benchmark(configs, iterations):
 
         assert iterations > 5
 
-        input = torch.randn([m, k], dtype=out_dtype, device=DEVICE) / 10.0
-        weight = torch.ones([n, k], dtype=out_dtype, device=DEVICE)
+        out_elem = torch.tensor([], dtype=out_dtype).element_size()
+        fp8_elem = torch.tensor([], dtype=fp8_dtype).element_size()
+        per_pair_bytes = m * k * out_elem + n * k * fp8_elem
+        pool_size = compute_pool_size(per_pair_bytes, iterations, cold_cache)
+
         scale_wei = torch.tensor(4.0, device=DEVICE)
 
-        weight_fp8, _ = scaled_fp8_quant(
-            weight, scale_wei, fp8_dtype=fp8_dtype, group_shape=(-1, 1)
-        )
-        weight_fp8_t = weight_fp8.transpose(0, 1)
+        inputs = []
+        weights_fp8_t = []
+        for _ in range(pool_size):
+            inp = torch.randn([m, k], dtype=out_dtype, device=DEVICE) / 10.0
+            wei = torch.ones([n, k], dtype=out_dtype, device=DEVICE)
+            wei_fp8, _ = scaled_fp8_quant(
+                wei, scale_wei, fp8_dtype=fp8_dtype, group_shape=(-1, 1)
+            )
+            inputs.append(inp)
+            weights_fp8_t.append(wei_fp8.transpose(0, 1))
 
         start_event = torch.xpu.Event(enable_timing=True)
         end_event = torch.xpu.Event(enable_timing=True)
         for index in range(5):
-            fp8_gemm_w8a16(input, weight_fp8_t, scale_wei, torch.Tensor())
+            fp8_gemm_w8a16(inputs[index % pool_size],
+                           weights_fp8_t[index % pool_size],
+                           scale_wei, torch.Tensor())
         start_event.record()
         for index in range(iterations - 5):
-            fp8_gemm_w8a16(input, weight_fp8_t, scale_wei, torch.Tensor())
+            fp8_gemm_w8a16(inputs[index % pool_size],
+                           weights_fp8_t[index % pool_size],
+                           scale_wei, torch.Tensor())
         end_event.record()
         torch.xpu.synchronize()
         ms = start_event.elapsed_time(end_event) / (iterations - 5)
@@ -693,7 +734,7 @@ def get_fp8_gemm_w8a16_benchmark(configs, iterations):
 # ---------------------------------------------------------------------------
 
 
-def get_fp8_gemm_per_channel_benchmark(configs, iterations):
+def get_fp8_gemm_per_channel_benchmark(configs, iterations, cold_cache=True):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -714,35 +755,46 @@ def get_fp8_gemm_per_channel_benchmark(configs, iterations):
 
         assert iterations > 5
 
-        input = torch.randn([m, k], dtype=out_dtype, device=DEVICE) / 10.0
-        weight = torch.randn([n, k], dtype=out_dtype, device=DEVICE) / 10.0
+        fp8_elem = torch.tensor([], dtype=fp8_dtype).element_size()
+        per_pair_bytes = (m * k + n * k) * fp8_elem
+        pool_size = compute_pool_size(per_pair_bytes, iterations, cold_cache)
 
-        input_fp8, scale_src = scaled_fp8_quant(
-            input, use_per_token_if_dynamic=True, fp8_dtype=fp8_dtype
-        )
-        weight_fp8, scale_wei = scaled_fp8_quant(
-            weight, use_per_token_if_dynamic=True, fp8_dtype=fp8_dtype
-        )
-        weight_fp8_t = weight_fp8.transpose(0, 1)
+        inputs_fp8 = []
+        weights_fp8_t = []
+        scales_src = []
+        scales_wei = []
+        for _ in range(pool_size):
+            inp = torch.randn([m, k], dtype=out_dtype, device=DEVICE) / 10.0
+            wei = torch.randn([n, k], dtype=out_dtype, device=DEVICE) / 10.0
+            inp_fp8, s_src = scaled_fp8_quant(
+                inp, use_per_token_if_dynamic=True, fp8_dtype=fp8_dtype
+            )
+            wei_fp8, s_wei = scaled_fp8_quant(
+                wei, use_per_token_if_dynamic=True, fp8_dtype=fp8_dtype
+            )
+            inputs_fp8.append(inp_fp8)
+            weights_fp8_t.append(wei_fp8.transpose(0, 1))
+            scales_src.append(s_src)
+            scales_wei.append(s_wei)
 
         start_event = torch.xpu.Event(enable_timing=True)
         end_event = torch.xpu.Event(enable_timing=True)
         for index in range(5):
             fp8_gemm(
-                input_fp8,
-                weight_fp8_t,
+                inputs_fp8[index % pool_size],
+                weights_fp8_t[index % pool_size],
                 out_dtype,
-                scale_src,
-                scale_wei,
+                scales_src[index % pool_size],
+                scales_wei[index % pool_size],
             )
         start_event.record()
         for index in range(iterations - 5):
             fp8_gemm(
-                input_fp8,
-                weight_fp8_t,
+                inputs_fp8[index % pool_size],
+                weights_fp8_t[index % pool_size],
                 out_dtype,
-                scale_src,
-                scale_wei,
+                scales_src[index % pool_size],
+                scales_wei[index % pool_size],
             )
         end_event.record()
         torch.xpu.synchronize()
@@ -766,7 +818,7 @@ def get_fp8_gemm_per_channel_benchmark(configs, iterations):
 # ---------------------------------------------------------------------------
 
 
-def get_mxfp8_gemm_benchmark(configs, iterations):
+def get_mxfp8_gemm_benchmark(configs, iterations, cold_cache=True):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -785,34 +837,45 @@ def get_mxfp8_gemm_benchmark(configs, iterations):
 
         assert iterations > 5
 
-        inputs = torch.randn((m, k), dtype=out_dtype, device=DEVICE) * 0.01
-        weights = torch.randn((n, k), dtype=out_dtype, device=DEVICE) * 0.01
+        fp8_elem = torch.tensor([], dtype=torch.float8_e4m3fn).element_size()
+        per_pair_bytes = (m * k + n * k) * fp8_elem
+        pool_size = compute_pool_size(per_pair_bytes, iterations, cold_cache)
 
-        if out_dtype == torch.half:
-            inputs = inputs.to(torch.float32)
-            weights = weights.to(torch.float32)
-
-        _, inputs_lp, inputs_scale = _convert_to_mxfp8(inputs)
-        _, weights_lp, weights_scale = _convert_to_mxfp8(weights)
+        inputs_lp_pool = []
+        weights_lp_t_pool = []
+        inputs_scale_pool = []
+        weights_scale_pool = []
+        for _ in range(pool_size):
+            inp = torch.randn((m, k), dtype=out_dtype, device=DEVICE) * 0.01
+            wei = torch.randn((n, k), dtype=out_dtype, device=DEVICE) * 0.01
+            if out_dtype == torch.half:
+                inp = inp.to(torch.float32)
+                wei = wei.to(torch.float32)
+            _, inp_lp, inp_scale = _convert_to_mxfp8(inp)
+            _, wei_lp, wei_scale = _convert_to_mxfp8(wei)
+            inputs_lp_pool.append(inp_lp)
+            weights_lp_t_pool.append(wei_lp.transpose(0, 1))
+            inputs_scale_pool.append(inp_scale)
+            weights_scale_pool.append(wei_scale)
 
         start_event = torch.xpu.Event(enable_timing=True)
         end_event = torch.xpu.Event(enable_timing=True)
         for index in range(5):
             fp8_gemm(
-                inputs_lp,
-                weights_lp.transpose(0, 1),
+                inputs_lp_pool[index % pool_size],
+                weights_lp_t_pool[index % pool_size],
                 out_dtype,
-                inputs_scale,
-                weights_scale,
+                inputs_scale_pool[index % pool_size],
+                weights_scale_pool[index % pool_size],
             )
         start_event.record()
         for index in range(iterations - 5):
             fp8_gemm(
-                inputs_lp,
-                weights_lp.transpose(0, 1),
+                inputs_lp_pool[index % pool_size],
+                weights_lp_t_pool[index % pool_size],
                 out_dtype,
-                inputs_scale,
-                weights_scale,
+                inputs_scale_pool[index % pool_size],
+                weights_scale_pool[index % pool_size],
             )
         end_event.record()
         torch.xpu.synchronize()
@@ -854,7 +917,7 @@ def _convert_to_mxfp4(t):
 # ---------------------------------------------------------------------------
 
 
-def get_mxfp4_gemm_benchmark(configs, iterations):
+def get_mxfp4_gemm_benchmark(configs, iterations, cold_cache=True):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -873,33 +936,44 @@ def get_mxfp4_gemm_benchmark(configs, iterations):
 
         assert iterations > 5
 
-        inputs = torch.randn((m, k), dtype=out_dtype, device=DEVICE) * 0.01
-        weights = torch.randn((n, k), dtype=out_dtype, device=DEVICE) * 0.01
+        # fp4 is packed as uint8 (2 elements per byte)
+        per_pair_bytes = (m * k + n * k) // 2
+        pool_size = compute_pool_size(per_pair_bytes, iterations, cold_cache)
 
-        if out_dtype == torch.half:
-            inputs = inputs.to(torch.float32)
-            weights = weights.to(torch.float32)
-
-        _, inputs_lp, inputs_scale = _convert_to_mxfp4(inputs)
-        _, weights_lp, weights_scale = _convert_to_mxfp4(weights)
+        inputs_lp_pool = []
+        weights_lp_t_pool = []
+        inputs_scale_pool = []
+        weights_scale_pool = []
+        for _ in range(pool_size):
+            inp = torch.randn((m, k), dtype=out_dtype, device=DEVICE) * 0.01
+            wei = torch.randn((n, k), dtype=out_dtype, device=DEVICE) * 0.01
+            if out_dtype == torch.half:
+                inp = inp.to(torch.float32)
+                wei = wei.to(torch.float32)
+            _, inp_lp, inp_scale = _convert_to_mxfp4(inp)
+            _, wei_lp, wei_scale = _convert_to_mxfp4(wei)
+            inputs_lp_pool.append(inp_lp)
+            weights_lp_t_pool.append(wei_lp.transpose(0, 1))
+            inputs_scale_pool.append(inp_scale)
+            weights_scale_pool.append(wei_scale)
 
         start_event = torch.xpu.Event(enable_timing=True)
         end_event = torch.xpu.Event(enable_timing=True)
         for index in range(5):
             fp4_gemm(
-                inputs_lp,
-                weights_lp.transpose(0, 1),
-                inputs_scale,
-                weights_scale,
+                inputs_lp_pool[index % pool_size],
+                weights_lp_t_pool[index % pool_size],
+                inputs_scale_pool[index % pool_size],
+                weights_scale_pool[index % pool_size],
                 out_dtype,
             )
         start_event.record()
         for index in range(iterations - 5):
             fp4_gemm(
-                inputs_lp,
-                weights_lp.transpose(0, 1),
-                inputs_scale,
-                weights_scale,
+                inputs_lp_pool[index % pool_size],
+                weights_lp_t_pool[index % pool_size],
+                inputs_scale_pool[index % pool_size],
+                weights_scale_pool[index % pool_size],
                 out_dtype,
             )
         end_event.record()
@@ -946,6 +1020,13 @@ def gemm_parse_args():
         type=str,
         default="./configs/gemm/",
         help="Path to save benchmark results",
+    )
+    parser.add_argument(
+        "--cold-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable cold-cache (use different data each iteration). "
+             "Use --no-cold-cache to reuse the same tensors (hot cache).",
     )
     args = parser.parse_args()
     if "all" in args.benchmarks:
@@ -1041,6 +1122,7 @@ if __name__ == "__main__":
         print()
         print("=" * 60)
         print(f"Performance: {label}{suffix}")
+        print(f"  cold_cache={args.cold_cache}")
         print("=" * 60)
-        bench = get_bench(configs, iterations)
+        bench = get_bench(configs, iterations, cold_cache=args.cold_cache)
         bench.run(print_data=True, save_path=args.save_path)
