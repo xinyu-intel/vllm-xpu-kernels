@@ -106,6 +106,59 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "local_experts_num) -> "
       "()");
   m.impl("remap_hidden_states", torch::kXPU, &remap_hidden_states);
+
+  m.def(
+      "ep_dispatch(Tensor rank_buffers_ptr, Tensor topk_idx, "
+      "Tensor scatter_idx, "
+      "Tensor(a!) remap_hidden_states, int num_experts, "
+      "int rank, int world_size) -> Tensor(a!)");
+  m.impl("ep_dispatch", torch::kXPU, &ep_dispatch);
+
+  m.def(
+      "ep_combine(Tensor expert_output, Tensor rank_output_ptrs, "
+      "Tensor topk_idx, Tensor scatter_idx, Tensor topk_weights, "
+      "Tensor(a!) output, int num_experts, "
+      "int rank, int world_size) -> Tensor(a!)");
+  m.impl("ep_combine", torch::kXPU, &ep_combine);
+
+  m.def(
+      "local_permute_copy(Tensor src_hidden, Tensor scatter_idx, "
+      "int remote_token_offset, "
+      "Tensor(a!) remap_hidden_states) -> Tensor(a!)");
+  m.impl("local_permute_copy", torch::kXPU, &local_permute_copy);
+
+  m.def(
+      "local_permute_copy_fused(Tensor src_all, Tensor scatter_idx, "
+      "Tensor(a!) remap_hidden_states) -> Tensor(a!)");
+  m.impl("local_permute_copy_fused", torch::kXPU, &local_permute_copy_fused);
+
+  m.def(
+      "allgather_permute(Tensor rank_buffers_ptr, Tensor scatter_idx, "
+      "Tensor(a!) remap_hidden_states, int rank, int world_size) -> "
+      "Tensor(a!)");
+  m.impl("allgather_permute", torch::kXPU, &allgather_permute);
+
+  m.def(
+      "allgather(Tensor rank_buffers_ptr, "
+      "Tensor(a!) output, int rank, int world_size) -> Tensor(a!)");
+  m.impl("allgather", torch::kXPU, &allgather);
+
+  m.def(
+      "allgather_with_symm_mem(Tensor input_shard, Tensor rank_buffers_ptr, "
+      "Tensor(a!) output, int rank, int world_size) -> Tensor(a!)");
+  m.impl("allgather_with_symm_mem", torch::kXPU, &allgather_with_symm_mem);
+
+  m.def(
+      "local_unpermute_copy(Tensor expert_output, Tensor scatter_idx, "
+      "Tensor topk_weights, int token_offset, int token_count, "
+      "Tensor(a!) output) -> Tensor(a!)");
+  m.impl("local_unpermute_copy", torch::kXPU, &local_unpermute_copy);
+
+  m.def(
+      "unpermute_reduce_scatter(Tensor rank_buffers_ptr, Tensor scatter_idx, "
+      "Tensor topk_weights, Tensor(a!) output, int rank, int world_size) -> "
+      "Tensor(a!)");
+  m.impl("unpermute_reduce_scatter", torch::kXPU, &unpermute_reduce_scatter);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

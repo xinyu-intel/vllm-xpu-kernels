@@ -109,3 +109,70 @@ void remap_hidden_states(
     torch::Tensor& topk_ids,
     int64_t total_experts_num,
     int64_t local_experts_num);
+
+at::Tensor ep_dispatch(
+    const at::Tensor& rank_buffers_ptr,
+    const at::Tensor& topk_idx,
+    const at::Tensor& scatter_idx,
+    at::Tensor remap_hidden_states,
+    int64_t num_experts,
+    int64_t rank,
+    int64_t world_size);
+
+at::Tensor ep_combine(
+    const at::Tensor& expert_output,
+    const at::Tensor& rank_output_ptrs,
+    const at::Tensor& topk_idx,
+    const at::Tensor& scatter_idx,
+    const at::Tensor& topk_weights,
+    at::Tensor output,
+    int64_t num_experts,
+    int64_t rank,
+    int64_t world_size);
+
+at::Tensor local_permute_copy(
+    const at::Tensor& src_hidden,
+    const at::Tensor& scatter_idx,
+    int64_t remote_token_offset,
+    at::Tensor remap_hidden_states);
+
+at::Tensor local_permute_copy_fused(
+    const at::Tensor& src_all,
+    const at::Tensor& scatter_idx,
+    at::Tensor remap_hidden_states);
+
+at::Tensor allgather_permute(
+    const at::Tensor& rank_buffers_ptr,
+    const at::Tensor& scatter_idx,
+    at::Tensor remap_hidden_states,
+    int64_t rank,
+    int64_t world_size);
+
+at::Tensor allgather(
+    const at::Tensor& rank_buffers_ptr,
+    at::Tensor output,
+    int64_t rank,
+    int64_t world_size);
+
+at::Tensor allgather_with_symm_mem(
+    const at::Tensor& input_shard,
+    const at::Tensor& rank_buffers_ptr,
+    at::Tensor output,
+    int64_t rank,
+    int64_t world_size);
+
+at::Tensor local_unpermute_copy(
+    const at::Tensor& expert_output,
+    const at::Tensor& scatter_idx,
+    const at::Tensor& topk_weights,
+    int64_t token_offset,
+    int64_t token_count,
+    at::Tensor output);
+
+at::Tensor unpermute_reduce_scatter(
+    const at::Tensor& rank_buffers_ptr,
+    const at::Tensor& scatter_idx,
+    const at::Tensor& topk_weights,
+    at::Tensor output,
+    int64_t rank,
+    int64_t world_size);
