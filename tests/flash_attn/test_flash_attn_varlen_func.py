@@ -1237,3 +1237,428 @@ def test_decode_with_cross_layer_paged_kv(
     torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
         f"{torch.max(torch.abs(output - ref_output))}"
     torch.xpu.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Packed KV cache layout tests (vllm/vllm#44455)
+#
+# The new vLLM KV cache layout packs K and V into a single 4D tensor:
+#   (num_blocks, num_kv_heads, block_size, 2 * head_size)
+# Backends extract K/V via:
+#   kv_cache.transpose(1, 2).split(head_size, dim=-1)
+# which yields non-contiguous views of shape
+#   (num_blocks, block_size, num_kv_heads, head_size)
+# with stride[-1] == 1 but stride[-2] == 2 * head_size (not head_size).
+# These tests verify the kernel handles this stride pattern correctly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("seq_lens", [[(1, 1328), (5, 18), (129, 463)]])
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("dtype", DTYPES, ids=format_tc)
+@pytest.mark.parametrize("window_size", [(-1, -1)])
+@pytest.mark.parametrize("is_casual", [True])
+@pytest.mark.parametrize("num_blocks", [2048])
+@torch.inference_mode()
+def test_varlen_with_packed_kv_layout(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    dtype: torch.dtype,
+    window_size: tuple[int, int],
+    is_casual: bool,
+    num_blocks: int,
+) -> None:
+    """Chunk prefill with the new packed KV cache layout from vllm#44455.
+
+    KV cache is allocated as (num_blocks, num_kv_heads, block_size, 2*head_size)
+    and K/V are extracted via transpose(1,2).split(head_size, dim=-1).
+    """
+    torch.set_default_device("xpu")
+    torch.xpu.set_device("xpu:0")
+    torch.manual_seed(4242)
+
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens),
+                        num_query_heads,
+                        head_size,
+                        dtype=dtype)
+
+    packed_kv = torch.randn(num_blocks,
+                            num_kv_heads,
+                            block_size,
+                            2 * head_size,
+                            dtype=dtype)
+
+    kv_transposed = packed_kv.transpose(1, 2)
+    key_cache, value_cache = kv_transposed.split(head_size, dim=-1)
+
+    assert key_cache.shape == (num_blocks, block_size, num_kv_heads, head_size)
+    assert not key_cache.is_contiguous()
+    assert key_cache.stride(-1) == 1
+    # stride(-2) is the head stride = block_size * 2*head_size (from the
+    # original num_kv_heads dim before transpose)
+    assert key_cache.stride(-2) == block_size * 2 * head_size
+    # stride(1) is the seq-position stride = 2*head_size (the content pitch)
+    assert key_cache.stride(1) == 2 * head_size
+
+    cu_query_lens = torch.tensor([0] + query_lens,
+                                 dtype=torch.int32).cumsum(dim=0,
+                                                           dtype=torch.int32)
+    seq_k = torch.tensor(kv_lens, dtype=torch.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(0,
+                                 num_blocks,
+                                 (num_seqs, max_num_blocks_per_seq),
+                                 dtype=torch.int32)
+
+    output = flash_attn_varlen_func(query,
+                                    key_cache,
+                                    value_cache,
+                                    max_query_len,
+                                    cu_query_lens,
+                                    max_kv_len,
+                                    seqused_k=seq_k,
+                                    softmax_scale=scale,
+                                    causal=is_casual,
+                                    block_table=block_tables,
+                                    window_size=window_size)
+
+    ref_output = ref_paged_attn(query=query,
+                                key_cache=key_cache.contiguous(),
+                                value_cache=value_cache.contiguous(),
+                                query_lens=query_lens,
+                                kv_lens=kv_lens,
+                                block_tables=block_tables,
+                                scale=scale,
+                                casual=is_casual,
+                                is_paged=True,
+                                window_size_left=window_size[0],
+                                window_size_right=window_size[1])
+    atol, rtol = 2e-2, 1e-2
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
+        f"{torch.max(torch.abs(output - ref_output))}"
+    torch.xpu.empty_cache()
+
+
+@pytest.mark.parametrize("seq_lens",
+                         [[(1, 523), (1, 37), (1, 2011)], [(1, 13000)]])
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("dtype", DTYPES, ids=format_tc)
+@pytest.mark.parametrize("window_size", [(-1, -1)])
+@pytest.mark.parametrize("num_blocks", [2048])
+@torch.inference_mode()
+def test_decode_with_packed_kv_layout(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    dtype: torch.dtype,
+    window_size: tuple[int, int],
+    num_blocks: int,
+) -> None:
+    """Paged decode with the new packed KV cache layout from vllm#44455.
+
+    KV cache is allocated as (num_blocks, num_kv_heads, block_size, 2*head_size)
+    and K/V are extracted via transpose(1,2).split(head_size, dim=-1).
+    """
+    torch.set_default_device("xpu")
+    torch.xpu.set_device("xpu:0")
+    torch.manual_seed(42)
+
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens),
+                        num_query_heads,
+                        head_size,
+                        dtype=dtype)
+
+    packed_kv = torch.randn(num_blocks,
+                            num_kv_heads,
+                            block_size,
+                            2 * head_size,
+                            dtype=dtype)
+
+    kv_transposed = packed_kv.transpose(1, 2)
+    key_cache, value_cache = kv_transposed.split(head_size, dim=-1)
+
+    assert key_cache.shape == (num_blocks, block_size, num_kv_heads, head_size)
+    assert not key_cache.is_contiguous()
+    assert key_cache.stride(-1) == 1
+    assert key_cache.stride(-2) == block_size * 2 * head_size
+    assert key_cache.stride(1) == 2 * head_size
+
+    cu_query_lens = torch.tensor([0] + query_lens,
+                                 dtype=torch.int32).cumsum(dim=0,
+                                                           dtype=torch.int32)
+    seq_k = torch.tensor(kv_lens, dtype=torch.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(0,
+                                 num_blocks,
+                                 (num_seqs, max_num_blocks_per_seq),
+                                 dtype=torch.int32)
+
+    output = flash_attn_varlen_func(query,
+                                    key_cache,
+                                    value_cache,
+                                    max_query_len,
+                                    cu_query_lens,
+                                    max_kv_len,
+                                    seqused_k=seq_k,
+                                    softmax_scale=scale,
+                                    causal=False,
+                                    block_table=block_tables,
+                                    window_size=window_size)
+
+    ref_output = ref_paged_attn(query=query,
+                                key_cache=key_cache.contiguous(),
+                                value_cache=value_cache.contiguous(),
+                                query_lens=query_lens,
+                                kv_lens=kv_lens,
+                                block_tables=block_tables,
+                                scale=scale,
+                                casual=False,
+                                is_paged=True,
+                                window_size_left=window_size[0],
+                                window_size_right=window_size[1])
+    atol, rtol = 1e-2, 1e-2
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
+        f"{torch.max(torch.abs(output - ref_output))}"
+    torch.xpu.empty_cache()
+
+
+@pytest.mark.parametrize("seq_lens",
+                         [[(1, 523), (1, 37), (1, 2011)], [(1, 13000)]])
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("dtype", DTYPES, ids=format_tc)
+@pytest.mark.parametrize("num_blocks", [2048])
+@pytest.mark.parametrize("fp8_dtype", FP8KV, ids=format_tc)
+@torch.inference_mode()
+def test_decode_with_packed_kv_layout_fp8(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    dtype: torch.dtype,
+    num_blocks: int,
+    fp8_dtype: Optional[torch.dtype],
+) -> None:
+    """Paged decode with packed KV layout + FP8 quantized KV cache."""
+    torch.set_default_device("xpu")
+    torch.xpu.set_device("xpu:0")
+    torch.manual_seed(42)
+
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens),
+                        num_query_heads,
+                        head_size,
+                        dtype=dtype)
+
+    packed_kv = torch.randn(num_blocks,
+                            num_kv_heads,
+                            block_size,
+                            2 * head_size,
+                            dtype=dtype)
+
+    kv_transposed = packed_kv.transpose(1, 2)
+    key_cache_ref, value_cache_ref = kv_transposed.split(head_size, dim=-1)
+
+    k_descale = None
+    v_descale = None
+    scale_shape = (num_seqs, num_kv_heads)
+    if fp8_dtype is not None:
+        k_descale = (torch.abs(key_cache_ref).max() / 200).to(torch.float32)
+        v_descale = (torch.abs(value_cache_ref).max() / 200).to(torch.float32)
+        packed_kv_q = (packed_kv / k_descale).to(fp8_dtype)
+        kv_transposed_q = packed_kv_q.transpose(1, 2)
+        key_cache, value_cache = kv_transposed_q.split(head_size, dim=-1)
+    else:
+        key_cache = key_cache_ref
+        value_cache = value_cache_ref
+
+    assert key_cache.shape == (num_blocks, block_size, num_kv_heads, head_size)
+    assert not key_cache.is_contiguous()
+    assert key_cache.stride(-1) == 1
+    assert key_cache.stride(1) == 2 * head_size
+
+    cu_query_lens = torch.tensor([0] + query_lens,
+                                 dtype=torch.int32).cumsum(dim=0,
+                                                           dtype=torch.int32)
+    seq_k = torch.tensor(kv_lens, dtype=torch.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(0,
+                                 num_blocks,
+                                 (num_seqs, max_num_blocks_per_seq),
+                                 dtype=torch.int32)
+
+    output = flash_attn_varlen_func(query,
+                                    key_cache,
+                                    value_cache,
+                                    max_query_len,
+                                    cu_query_lens,
+                                    max_kv_len,
+                                    seqused_k=seq_k,
+                                    softmax_scale=scale,
+                                    causal=False,
+                                    block_table=block_tables,
+                                    k_descale=k_descale.expand(scale_shape)
+                                    if k_descale is not None else None,
+                                    v_descale=v_descale.expand(scale_shape)
+                                    if v_descale is not None else None,
+                                    window_size=(-1, -1))
+
+    ref_output = ref_paged_attn(query=query,
+                                key_cache=key_cache.contiguous(),
+                                value_cache=value_cache.contiguous(),
+                                query_lens=query_lens,
+                                kv_lens=kv_lens,
+                                block_tables=block_tables,
+                                scale=scale,
+                                casual=False,
+                                is_paged=True,
+                                k_descale=k_descale,
+                                v_descale=v_descale,
+                                window_size_left=-1,
+                                window_size_right=-1,
+                                is_fp8kv=fp8_dtype is not None,
+                                dtype=dtype)
+    atol, rtol = 1.5e-2, 1.5e-2
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
+        f"{torch.max(torch.abs(output - ref_output))}"
+    torch.xpu.empty_cache()
+
+
+@pytest.mark.parametrize("seq_lens", [[(1, 1328), (5, 18), (129, 463)]])
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=format_tc)
+@pytest.mark.parametrize("num_layers", NUM_LAYERS)
+@torch.inference_mode()
+def test_varlen_with_packed_kv_cross_layer(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    dtype: torch.dtype,
+    num_layers: int,
+) -> None:
+    """Cross-layer KV cache with the new packed layout from vllm#44455.
+
+    Simulates the offloading KV connector layout where the physical buffer is:
+      (num_blocks, num_layers, num_kv_heads, block_size, 2*head_size)
+    and each layer's view is a non-contiguous slice with a large block stride.
+    """
+    torch.set_default_device("xpu")
+    torch.xpu.set_device("xpu:0")
+    torch.manual_seed(4242)
+    num_blocks = NUM_BLOCKS[0]
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens),
+                        num_query_heads,
+                        head_size,
+                        dtype=dtype)
+
+    combined_kv_cache = torch.randn(num_blocks,
+                                    num_layers,
+                                    num_kv_heads,
+                                    block_size,
+                                    2 * head_size,
+                                    dtype=dtype)
+
+    # Layer 0 view: (num_blocks, num_kv_heads, block_size, 2*head_size)
+    layer_kv = combined_kv_cache[:, 0, :, :, :]
+
+    # Extract K/V via transpose + split
+    kv_transposed = layer_kv.transpose(1, 2)
+    key_cache, value_cache = kv_transposed.split(head_size, dim=-1)
+
+    assert key_cache.shape == (num_blocks, block_size, num_kv_heads, head_size)
+    assert not key_cache.is_contiguous()
+    assert key_cache.stride(-1) == 1
+    assert key_cache.stride(0) == num_layers * num_kv_heads * block_size * \
+        2 * head_size
+
+    cu_query_lens = torch.tensor([0] + query_lens,
+                                 dtype=torch.int32).cumsum(dim=0,
+                                                           dtype=torch.int32)
+    seq_k = torch.tensor(kv_lens, dtype=torch.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(0,
+                                 num_blocks,
+                                 (num_seqs, max_num_blocks_per_seq),
+                                 dtype=torch.int32)
+
+    output = flash_attn_varlen_func(query,
+                                    key_cache,
+                                    value_cache,
+                                    max_query_len,
+                                    cu_query_lens,
+                                    max_kv_len,
+                                    seqused_k=seq_k,
+                                    softmax_scale=scale,
+                                    causal=True,
+                                    block_table=block_tables,
+                                    window_size=(-1, -1))
+
+    ref_output = ref_paged_attn(query=query,
+                                key_cache=key_cache.contiguous(),
+                                value_cache=value_cache.contiguous(),
+                                query_lens=query_lens,
+                                kv_lens=kv_lens,
+                                block_tables=block_tables,
+                                scale=scale,
+                                casual=True,
+                                is_paged=True,
+                                window_size_left=-1,
+                                window_size_right=-1)
+    atol, rtol = 2e-2, 1e-2
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
+        f"{torch.max(torch.abs(output - ref_output))}"
+    torch.xpu.empty_cache()
