@@ -151,7 +151,6 @@ class reshape_and_cache_flash_kernel {
 
     const int64_t block_idx = slot_idx / block_size_;
     const int64_t block_offset = slot_idx % block_size_;
-    const int n = num_heads_ * head_size_;
 
     // pointers to the beginning of the source row for this token.
     const scalar_t* __restrict__ key_src = key_ + group_idx * key_stride_;
@@ -169,10 +168,34 @@ class reshape_and_cache_flash_kernel {
 
     fp8::CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
     fp8::CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
-    vectorize_with_alignment<VEC_SIZE>(
-        key_src, key_dst, n, local_idx, local_range, k_op);
-    vectorize_with_alignment<VEC_SIZE>(
-        value_src, value_dst, n, local_idx, local_range, v_op);
+
+    if (head_stride_ == head_size_) {
+      // Fast path: heads are contiguous in the cache (old layout).
+      const int n = num_heads_ * head_size_;
+      vectorize_with_alignment<VEC_SIZE>(
+          key_src, key_dst, n, local_idx, local_range, k_op);
+      vectorize_with_alignment<VEC_SIZE>(
+          value_src, value_dst, n, local_idx, local_range, v_op);
+    } else {
+      // Strided path: heads are non-contiguous (packed KV layout).
+      // Write head_size elements per head, striding by head_stride_ in dst.
+      for (int h = 0; h < num_heads_; ++h) {
+        vectorize_with_alignment<VEC_SIZE>(
+            key_src + h * head_size_,
+            key_dst + h * head_stride_,
+            head_size_,
+            local_idx,
+            local_range,
+            k_op);
+        vectorize_with_alignment<VEC_SIZE>(
+            value_src + h * head_size_,
+            value_dst + h * head_stride_,
+            head_size_,
+            local_idx,
+            local_range,
+            v_op);
+      }
+    }
   }
 
  private:
